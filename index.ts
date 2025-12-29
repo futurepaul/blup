@@ -1,3 +1,5 @@
+#!/usr/bin/env bun
+
 import { finalizeEvent } from "nostr-tools";
 import { decode } from "nostr-tools/nip19";
 import os from "os";
