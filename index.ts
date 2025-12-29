@@ -205,12 +205,25 @@ async function configure(
   console.log(`Config saved to ${getConfigPath()}`);
 }
 
+async function setServer(server: string): Promise<void> {
+  try {
+    new URL(server);
+  } catch {
+    console.error("Error: argument must be a valid URL");
+    process.exit(1);
+  }
+
+  await saveConfig({ server });
+  console.log(`Server updated to ${server}`);
+}
+
 // CLI
 const args = process.argv.slice(2);
 
 if (args.length < 1) {
   console.error("Usage:");
   console.error("  bun run index.ts config <npub> <nsec> <server-url>");
+  console.error("  bun run index.ts server <server-url>");
   console.error("  bun run index.ts list");
   console.error("  bun run index.ts upload <filename>");
   process.exit(1);
@@ -225,6 +238,13 @@ switch (command) {
       process.exit(1);
     }
     await configure(rest[0], rest[1], rest[2]);
+    break;
+  case "server":
+    if (!rest[0]) {
+      console.error("Usage: bun run index.ts server <server-url>");
+      process.exit(1);
+    }
+    await setServer(rest[0]);
     break;
   case "list": {
     const config = await loadConfig();
