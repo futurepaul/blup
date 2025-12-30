@@ -7,6 +7,23 @@ import { secrets } from "bun";
 
 const SERVICE_NAME = "com.blossom.up";
 
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+}
+
+function renderProgress(loaded: number, total?: number, width = 30): string {
+  if (total) {
+    const ratio = Math.min(loaded / total, 1);
+    const filled = Math.round(ratio * width);
+    const empty = width - filled;
+    const pct = (ratio * 100).toFixed(0).padStart(3);
+    return `[${"=".repeat(filled)}${" ".repeat(empty)}] ${pct}% ${formatBytes(loaded)}/${formatBytes(total)}`;
+  }
+  return `${formatBytes(loaded)}`;
+}
+
 const DEFAULT_RELAYS = [
   "wss://relay.damus.io",
   "wss://nos.lol",
@@ -164,15 +181,42 @@ async function uploadBytes(
   const authHeader = `Nostr ${btoa(JSON.stringify(authEvent))}`;
 
   const url = `${serverUrl.replace(/\/$/, "")}/upload`;
+  const total = bytes.length;
+
+  // Create a streaming body with progress
+  let loaded = 0;
+  const chunkSize = 64 * 1024; // 64KB chunks
+
+  const progressStream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      let offset = 0;
+      const pushChunk = () => {
+        if (offset >= total) {
+          controller.close();
+          process.stdout.write("\r" + renderProgress(total, total) + "\n");
+          return;
+        }
+        const chunk = bytes.slice(offset, offset + chunkSize);
+        offset += chunk.length;
+        loaded += chunk.length;
+        process.stdout.write("\r" + renderProgress(loaded, total));
+        controller.enqueue(chunk);
+        // Use setTimeout to yield and allow progress to render
+        setTimeout(pushChunk, 0);
+      };
+      pushChunk();
+    },
+  });
 
   const response = await fetch(url, {
     method: "PUT",
     headers: {
       Authorization: authHeader,
       "Content-Type": contentType,
-      "Content-Length": bytes.length.toString(),
+      "Content-Length": total.toString(),
     },
-    body: bytes,
+    body: progressStream,
+    duplex: "half",
   });
 
   if (!response.ok) {
@@ -196,6 +240,7 @@ async function uploadBlob(serverUrl: string, filePath: string): Promise<void> {
   const fileBytes = new Uint8Array(fileBuffer);
   const contentType = file.type || "application/octet-stream";
 
+  console.log(`Uploading ${filePath}...`);
   await uploadBytes(serverUrl, fileBytes, contentType);
 }
 
@@ -397,16 +442,40 @@ async function mirrorBlob(sourceUrl: string): Promise<void> {
   }
 
   const sourceResponse = await fetch(sourceUrl);
-  if (!sourceResponse.ok) {
+  if (!sourceResponse.ok || !sourceResponse.body) {
     console.error(`Error fetching source: ${sourceResponse.status}`);
     process.exit(1);
   }
 
   const contentType =
     sourceResponse.headers.get("Content-Type") || "application/octet-stream";
-  const fileBuffer = await sourceResponse.arrayBuffer();
-  const fileBytes = new Uint8Array(fileBuffer);
+  const contentLength = sourceResponse.headers.get("Content-Length");
+  const total = contentLength ? parseInt(contentLength, 10) : undefined;
 
+  // Download with progress
+  console.log("Downloading...");
+  const reader = sourceResponse.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let loaded = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    loaded += value.length;
+    process.stdout.write("\r" + renderProgress(loaded, total));
+  }
+  process.stdout.write("\r" + renderProgress(loaded, loaded) + "\n");
+
+  // Combine chunks
+  const fileBytes = new Uint8Array(loaded);
+  let offset = 0;
+  for (const chunk of chunks) {
+    fileBytes.set(chunk, offset);
+    offset += chunk.length;
+  }
+
+  console.log("Uploading...");
   await uploadBytes(serverUrl, fileBytes, contentType);
 }
 
