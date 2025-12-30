@@ -2,48 +2,63 @@
 
 import { finalizeEvent } from "nostr-tools";
 import { decode } from "nostr-tools/nip19";
-import os from "os";
-import path from "path";
+import { SimplePool } from "nostr-tools/pool";
 import { secrets } from "bun";
 
 const SERVICE_NAME = "com.blossom.up";
 
-interface Config {
-  server: string;
+const DEFAULT_RELAYS = [
+  "wss://relay.damus.io",
+  "wss://nos.lol",
+  "wss://relay.primal.net",
+];
+
+const pool = new SimplePool();
+
+function getRelays(): string[] {
+  const envRelays = Bun.env.UP_RELAYS;
+  if (envRelays) {
+    return envRelays.split(",").map((r) => r.trim());
+  }
+  return DEFAULT_RELAYS;
 }
 
-function getConfigDir(): string {
-  const platform = os.platform();
+async function fetchServerList(pubkey: string): Promise<string[]> {
+  const relays = getRelays();
 
-  if (platform === "win32") {
-    const appData = Bun.env.APPDATA || Bun.env.LOCALAPPDATA;
-    if (!appData) throw new Error("APPDATA/LOCALAPPDATA not set");
-    return path.join(appData, "up");
+  const event = await pool.get(relays, {
+    kinds: [10063],
+    authors: [pubkey],
+  });
+
+  if (!event) {
+    return [];
   }
 
-  const home = os.homedir();
-  const xdgConfigHome = Bun.env.XDG_CONFIG_HOME || path.join(home, ".config");
-  return path.join(xdgConfigHome, "up");
+  return event.tags
+    .filter((t): t is [string, string, ...string[]] => t[0] === "server" && typeof t[1] === "string")
+    .map((t) => t[1]);
 }
 
-function getConfigPath(): string {
-  return path.join(getConfigDir(), "up_config.json");
-}
+async function publishServerList(
+  secretKey: Uint8Array,
+  servers: string[]
+): Promise<void> {
+  const relays = getRelays();
 
-async function loadConfig(): Promise<Config | null> {
-  const configPath = getConfigPath();
-  const file = Bun.file(configPath);
-  if (!(await file.exists())) {
-    return null;
-  }
-  return file.json();
-}
+  const tags = servers.map((s) => ["server", s]);
 
-async function saveConfig(config: Config): Promise<void> {
-  const configDir = getConfigDir();
-  await Bun.$`mkdir -p ${configDir}`;
-  const configPath = getConfigPath();
-  await Bun.write(configPath, JSON.stringify(config, null, 2));
+  const event = finalizeEvent(
+    {
+      kind: 10063,
+      content: "",
+      created_at: Math.floor(Date.now() / 1000),
+      tags,
+    },
+    secretKey
+  );
+
+  await Promise.any(pool.publish(relays, event));
 }
 
 async function getNsec(): Promise<string> {
@@ -130,7 +145,11 @@ async function listBlobs(serverUrl: string): Promise<void> {
   console.log(JSON.stringify(blobs, null, 2));
 }
 
-async function uploadBlob(serverUrl: string, filePath: string): Promise<void> {
+async function uploadBytes(
+  serverUrl: string,
+  bytes: Uint8Array,
+  contentType: string
+): Promise<void> {
   const nsec = await getNsec();
 
   const secretKey = decode(nsec);
@@ -139,15 +158,7 @@ async function uploadBlob(serverUrl: string, filePath: string): Promise<void> {
     process.exit(1);
   }
 
-  const file = Bun.file(filePath);
-  if (!(await file.exists())) {
-    console.error(`Error: File not found: ${filePath}`);
-    process.exit(1);
-  }
-
-  const fileBuffer = await file.arrayBuffer();
-  const fileBytes = new Uint8Array(fileBuffer);
-  const hash = new Bun.SHA256().update(fileBytes).digest("hex");
+  const hash = new Bun.SHA256().update(bytes).digest("hex");
 
   const authEvent = createAuthEvent(secretKey.data, "upload", hash);
   const authHeader = `Nostr ${btoa(JSON.stringify(authEvent))}`;
@@ -158,10 +169,10 @@ async function uploadBlob(serverUrl: string, filePath: string): Promise<void> {
     method: "PUT",
     headers: {
       Authorization: authHeader,
-      "Content-Type": file.type || "application/octet-stream",
-      "Content-Length": fileBytes.length.toString(),
+      "Content-Type": contentType,
+      "Content-Length": bytes.length.toString(),
     },
-    body: fileBytes,
+    body: bytes,
   });
 
   if (!response.ok) {
@@ -174,12 +185,21 @@ async function uploadBlob(serverUrl: string, filePath: string): Promise<void> {
   console.log(JSON.stringify(blob, null, 2));
 }
 
-async function configure(
-  npub: string,
-  nsec: string,
-  server: string
-): Promise<void> {
-  console.log(`Configuring with npub: ${npub}, nsec: ${nsec}, server: ${server}`);
+async function uploadBlob(serverUrl: string, filePath: string): Promise<void> {
+  const file = Bun.file(filePath);
+  if (!(await file.exists())) {
+    console.error(`Error: File not found: ${filePath}`);
+    process.exit(1);
+  }
+
+  const fileBuffer = await file.arrayBuffer();
+  const fileBytes = new Uint8Array(fileBuffer);
+  const contentType = file.type || "application/octet-stream";
+
+  await uploadBytes(serverUrl, fileBytes, contentType);
+}
+
+async function configure(npub: string, nsec: string): Promise<void> {
   const publicKey = decode(npub);
   if (publicKey.type !== "npub") {
     console.error("Error: first argument must be a valid npub");
@@ -192,42 +212,222 @@ async function configure(
     process.exit(1);
   }
 
-  try {
-    new URL(server);
-  } catch {
-    console.error("Error: third argument must be a valid URL");
+  await secrets.set({ service: SERVICE_NAME, name: "npub", value: npub });
+  await secrets.set({ service: SERVICE_NAME, name: "nsec", value: nsec });
+
+  console.log("Credentials stored in system keychain");
+}
+
+async function getPreferredServer(): Promise<string> {
+  const npub = await getNpub();
+  const publicKey = decode(npub);
+  if (publicKey.type !== "npub") {
+    console.error("Error: stored npub is invalid");
     process.exit(1);
   }
 
-  await secrets.set({ service: SERVICE_NAME, name: "npub", value: npub });
-  await secrets.set({ service: SERVICE_NAME, name: "nsec", value: nsec });
-  await saveConfig({ server });
+  const servers = await fetchServerList(publicKey.data);
+  if (servers.length === 0) {
+    console.error("Error: No servers configured. Run 'up server <url>' first.");
+    process.exit(1);
+  }
 
-  console.log("Credentials stored in system keychain");
-  console.log(`Config saved to ${getConfigPath()}`);
+  return servers[0] as string;
 }
 
-async function setServer(server: string): Promise<void> {
+async function addServer(serverUrl: string): Promise<void> {
   try {
-    new URL(server);
+    new URL(serverUrl);
   } catch {
     console.error("Error: argument must be a valid URL");
     process.exit(1);
   }
 
-  await saveConfig({ server });
-  console.log(`Server updated to ${server}`);
+  const nsec = await getNsec();
+  const npub = await getNpub();
+
+  const secretKey = decode(nsec);
+  if (secretKey.type !== "nsec") {
+    console.error("Error: stored nsec is invalid");
+    process.exit(1);
+  }
+
+  const publicKey = decode(npub);
+  if (publicKey.type !== "npub") {
+    console.error("Error: stored npub is invalid");
+    process.exit(1);
+  }
+
+  const existingServers = await fetchServerList(publicKey.data);
+
+  // Add new server to the front if not already present
+  const normalizedUrl = serverUrl.replace(/\/$/, "");
+  const filteredServers = existingServers.filter(
+    (s) => s.replace(/\/$/, "") !== normalizedUrl
+  );
+  const newServers = [normalizedUrl, ...filteredServers];
+
+  console.log("Publishing server list to relays...");
+  await publishServerList(secretKey.data, newServers);
+  console.log(`Server ${normalizedUrl} added to your server list`);
 }
 
-// CLI
-const args = process.argv.slice(2);
+async function listServers(): Promise<void> {
+  const npub = await getNpub();
+  const publicKey = decode(npub);
+  if (publicKey.type !== "npub") {
+    console.error("Error: stored npub is invalid");
+    process.exit(1);
+  }
+
+  const servers = await fetchServerList(publicKey.data);
+  if (servers.length === 0) {
+    console.log("No servers configured. Run 'up server <url>' to add one.");
+    return;
+  }
+
+  console.log("Configured servers:");
+  servers.forEach((s, i) => {
+    const marker = i === 0 ? " (primary)" : "";
+    console.log(`  ${i + 1}. ${s}${marker}`);
+  });
+}
+
+async function prompt(message: string): Promise<string> {
+  process.stdout.write(message);
+  for await (const line of console) {
+    return line;
+  }
+  return "";
+}
+
+async function preferServer(): Promise<void> {
+  const nsec = await getNsec();
+  const npub = await getNpub();
+
+  const secretKey = decode(nsec);
+  if (secretKey.type !== "nsec") {
+    console.error("Error: stored nsec is invalid");
+    process.exit(1);
+  }
+
+  const publicKey = decode(npub);
+  if (publicKey.type !== "npub") {
+    console.error("Error: stored npub is invalid");
+    process.exit(1);
+  }
+
+  const servers = await fetchServerList(publicKey.data);
+  if (servers.length === 0) {
+    console.log("No servers configured. Run 'up server <url>' to add one.");
+    return;
+  }
+
+  if (servers.length === 1) {
+    console.log("Only one server configured, already preferred.");
+    return;
+  }
+
+  console.log("Select preferred server:");
+  servers.forEach((s, i) => {
+    const marker = i === 0 ? " (current)" : "";
+    console.log(`  ${i + 1}. ${s}${marker}`);
+  });
+
+  const input = await prompt("Enter number: ");
+  const choice = parseInt(input.trim(), 10);
+
+  if (isNaN(choice) || choice < 1 || choice > servers.length) {
+    console.error("Invalid selection");
+    process.exit(1);
+  }
+
+  if (choice === 1) {
+    console.log("Server is already preferred.");
+    return;
+  }
+
+  // Move chosen server to front
+  const chosen = servers[choice - 1]!;
+  const newServers = [chosen, ...servers.filter((_, i) => i !== choice - 1)];
+
+  console.log("Publishing updated server list...");
+  await publishServerList(secretKey.data, newServers);
+  console.log(`${chosen} is now your preferred server`);
+}
+
+async function mirrorBlob(sourceUrl: string): Promise<void> {
+  const nsec = await getNsec();
+  const serverUrl = await getPreferredServer();
+
+  const secretKey = decode(nsec);
+  if (secretKey.type !== "nsec") {
+    console.error("Error: stored nsec is invalid");
+    process.exit(1);
+  }
+
+  // First, try the server's /mirror endpoint
+  const mirrorUrl = `${serverUrl.replace(/\/$/, "")}/mirror`;
+
+  // Create auth event for mirror (uses upload type)
+  const authEvent = createAuthEvent(secretKey.data, "upload");
+  const authHeader = `Nostr ${btoa(JSON.stringify(authEvent))}`;
+
+  const mirrorResponse = await fetch(mirrorUrl, {
+    method: "PUT",
+    headers: {
+      Authorization: authHeader,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ url: sourceUrl }),
+  });
+
+  if (mirrorResponse.ok) {
+    const blob = await mirrorResponse.json();
+    console.log(JSON.stringify(blob, null, 2));
+    return;
+  }
+
+  // Fall back to download + upload if /mirror not supported or fails
+  if (mirrorResponse.status === 404) {
+    console.log("Server does not support /mirror, downloading and reuploading...");
+  } else {
+    const error = await mirrorResponse.text();
+    console.log(`Mirror failed (${mirrorResponse.status}: ${error}), downloading and reuploading...`);
+  }
+
+  const sourceResponse = await fetch(sourceUrl);
+  if (!sourceResponse.ok) {
+    console.error(`Error fetching source: ${sourceResponse.status}`);
+    process.exit(1);
+  }
+
+  const contentType =
+    sourceResponse.headers.get("Content-Type") || "application/octet-stream";
+  const fileBuffer = await sourceResponse.arrayBuffer();
+  const fileBytes = new Uint8Array(fileBuffer);
+
+  await uploadBytes(serverUrl, fileBytes, contentType);
+}
+
+function printUsage(): void {
+  console.log("up - A simple CLI for Blossom servers");
+  console.log("");
+  console.log("Usage:");
+  console.log("  up config <npub> <nsec>    Set up your Nostr keys (stored in system keychain)");
+  console.log("  up server <url>            Add a server to your list");
+  console.log("  up server list             View configured servers");
+  console.log("  up server prefer           Set preferred server");
+  console.log("  up list                    List your uploaded blobs");
+  console.log("  up upload <filename>       Upload a file");
+  console.log("  up mirror <url>            Mirror a URL to your server");
+}
+
+// CLI using Bun.argv
+const args = Bun.argv.slice(2);
 
 if (args.length < 1) {
-  console.error("Usage:");
-  console.error("  bun run index.ts config <npub> <nsec> <server-url>");
-  console.error("  bun run index.ts server <server-url>");
-  console.error("  bun run index.ts list");
-  console.error("  bun run index.ts upload <filename>");
+  printUsage();
   process.exit(1);
 }
 
@@ -235,42 +435,64 @@ const [command, ...rest] = args;
 
 switch (command) {
   case "config":
-    if (!rest[0] || !rest[1] || !rest[2]) {
-      console.error("Usage: bun run index.ts config <npub> <nsec> <server-url>");
+    if (!rest[0] || !rest[1]) {
+      console.error("Usage: up config <npub> <nsec>");
       process.exit(1);
     }
-    await configure(rest[0], rest[1], rest[2]);
+    await configure(rest[0], rest[1]);
     break;
+
   case "server":
-    if (!rest[0]) {
-      console.error("Usage: bun run index.ts server <server-url>");
+    if (rest[0] === "list") {
+      await listServers();
+    } else if (rest[0] === "prefer") {
+      await preferServer();
+    } else if (rest[0]) {
+      await addServer(rest[0]);
+    } else {
+      console.error("Usage:");
+      console.error("  up server <url>      Add a server");
+      console.error("  up server list       View configured servers");
+      console.error("  up server prefer     Set preferred server");
       process.exit(1);
     }
-    await setServer(rest[0]);
     break;
+
   case "list": {
-    const config = await loadConfig();
-    if (!config) {
-      console.error("Error: No config found. Run 'config' first.");
-      process.exit(1);
-    }
-    await listBlobs(config.server);
+    const serverUrl = await getPreferredServer();
+    await listBlobs(serverUrl);
     break;
   }
+
   case "upload": {
     if (!rest[0]) {
-      console.error("Usage: bun run index.ts upload <filename>");
+      console.error("Usage: up upload <filename>");
       process.exit(1);
     }
-    const config = await loadConfig();
-    if (!config) {
-      console.error("Error: No config found. Run 'config' first.");
-      process.exit(1);
-    }
-    await uploadBlob(config.server, rest[0]);
+    const serverUrl = await getPreferredServer();
+    await uploadBlob(serverUrl, rest[0]);
     break;
   }
+
+  case "mirror": {
+    if (!rest[0]) {
+      console.error("Usage: up mirror <url>");
+      process.exit(1);
+    }
+    await mirrorBlob(rest[0]);
+    break;
+  }
+
+  case "help":
+  case "--help":
+  case "-h":
+    printUsage();
+    break;
+
   default:
     console.error(`Unknown command: ${command}`);
+    printUsage();
     process.exit(1);
 }
+
+process.exit(0);
