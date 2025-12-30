@@ -1,17 +1,17 @@
-# up
+# blup
 
 A simple CLI for uploading and listing files on [Blossom](https://github.com/hzrd149/blossom) servers.
 
 ## Quick start
 
 ```bash
-bunx github:futurepaul/up
+bunx github:futurepaul/blup
 ```
 
 ## Install
 
 ```bash
-bun install -g github:futurepaul/up
+bun install -g github:futurepaul/blup
 ```
 
 ## Usage
@@ -21,39 +21,39 @@ bun install -g github:futurepaul/up
 Set up your Nostr keys (stored in the system keychain):
 
 ```bash
-up config <npub> <nsec>
+blup config <npub> <nsec>
 ```
 
 Example:
 ```bash
-up config npub1... nsec1...
+blup config npub1... nsec1...
 ```
 
 ### Server list
 
-Blossom best practices encourage keeping an ordered list of trusted upload servers. `up` publishes (and subsequently reads) this list as a nostr `kind:10063` server-list event. By default the event is synced with `wss://relay.damus.io`, `wss://nos.lol`, and `wss://relay.primal.net`; override this set with `UP_RELAYS=wss://relay.one,wss://relay.two`. Run `config` first so `up` can sign the event with your key. When you list or upload, `up` fetches the latest published list from those relays (prompting you only when no list exists yet).
+Blossom best practices encourage keeping an ordered list of trusted upload servers. `blup` publishes (and subsequently reads) this list as a nostr `kind:10063` server-list event. By default the event is synced with `wss://relay.damus.io`, `wss://nos.lol`, and `wss://relay.primal.net`; override this set with `BLUP_RELAYS=wss://relay.one,wss://relay.two`. Run `config` first so `blup` can sign the event with your key. When you list or upload, `blup` fetches the latest published list from those relays (prompting you only when no list exists yet).
 
 Add a server (or create the list if it does not exist):
 
 ```bash
-up server <server-url>
+blup server <server-url>
 ```
 
 Example:
 ```bash
-up server https://blossom.primal.net
+blup server https://blossom.primal.net
 ```
 
 View the configured servers (first entry is the primary upload target):
 
 ```bash
-up server list
+blup server list
 ```
 
 Set a different server as preferred:
 
 ```bash
-up server prefer
+blup server prefer
 ```
 
 ### List files
@@ -61,7 +61,7 @@ up server prefer
 List your uploaded blobs on your preferred server:
 
 ```bash
-up list
+blup list
 ```
 
 ### Upload
@@ -69,20 +69,20 @@ up list
 Upload a file to your preferred server:
 
 ```bash
-up upload <filename>
+blup upload <filename>
 ```
 
 Example:
 ```bash
-up upload ./image.png
+blup upload ./image.png
 ```
 
 ### Mirror
 
-Mirror an existing URL (Blossom or not) to your preferred server. If a server supports `/mirror`, it will fetch directly; otherwise `up` downloads the source blob and reuploads it.
+Mirror an existing URL (Blossom or not) to your preferred server. If a server supports `/mirror`, it will fetch directly; otherwise `blup` downloads the source blob and reuploads it.
 
 ```bash
-up mirror <url>
+blup mirror <url>
 ```
 
 ### Blossom servers

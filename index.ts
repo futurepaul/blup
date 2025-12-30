@@ -5,7 +5,7 @@ import { decode } from "nostr-tools/nip19";
 import { SimplePool } from "nostr-tools/pool";
 import { secrets } from "bun";
 
-const SERVICE_NAME = "com.blossom.up";
+const SERVICE_NAME = "com.blossom.blup";
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -33,7 +33,7 @@ const DEFAULT_RELAYS = [
 const pool = new SimplePool();
 
 function getRelays(): string[] {
-  const envRelays = Bun.env.UP_RELAYS;
+  const envRelays = Bun.env.BLUP_RELAYS;
   if (envRelays) {
     return envRelays.split(",").map((r) => r.trim());
   }
@@ -294,7 +294,7 @@ async function getPreferredServer(): Promise<string> {
 
   const servers = await fetchServerList(publicKey.data);
   if (servers.length === 0) {
-    console.error("Error: No servers configured. Run 'up server <url>' first.");
+    console.error("Error: No servers configured. Run 'blup server <url>' first.");
     process.exit(1);
   }
 
@@ -348,7 +348,7 @@ async function listServers(): Promise<void> {
 
   const servers = await fetchServerList(publicKey.data);
   if (servers.length === 0) {
-    console.log("No servers configured. Run 'up server <url>' to add one.");
+    console.log("No servers configured. Run 'blup server <url>' to add one.");
     return;
   }
 
@@ -385,7 +385,7 @@ async function preferServer(): Promise<void> {
 
   const servers = await fetchServerList(publicKey.data);
   if (servers.length === 0) {
-    console.log("No servers configured. Run 'up server <url>' to add one.");
+    console.log("No servers configured. Run 'blup server <url>' to add one.");
     return;
   }
 
@@ -501,16 +501,16 @@ async function mirrorBlob(sourceUrl: string): Promise<void> {
 }
 
 function printUsage(): void {
-  console.log("up - A simple CLI for Blossom servers");
+  console.log("blup - A simple CLI for Blossom servers");
   console.log("");
   console.log("Usage:");
-  console.log("  up config <npub> <nsec>    Set up your Nostr keys (stored in system keychain)");
-  console.log("  up server <url>            Add a server to your list");
-  console.log("  up server list             View configured servers");
-  console.log("  up server prefer           Set preferred server");
-  console.log("  up list                    List your uploaded blobs");
-  console.log("  up upload <filename>       Upload a file");
-  console.log("  up mirror <url>            Mirror a URL to your server");
+  console.log("  blup config <npub> <nsec>    Set up your Nostr keys (stored in system keychain)");
+  console.log("  blup server <url>            Add a server to your list");
+  console.log("  blup server list             View configured servers");
+  console.log("  blup server prefer           Set preferred server");
+  console.log("  blup list                    List your uploaded blobs");
+  console.log("  blup upload <filename>       Upload a file");
+  console.log("  blup mirror <url>            Mirror a URL to your server");
 }
 
 // CLI using Bun.argv
@@ -526,7 +526,7 @@ const [command, ...rest] = args;
 switch (command) {
   case "config":
     if (!rest[0] || !rest[1]) {
-      console.error("Usage: up config <npub> <nsec>");
+      console.error("Usage: blup config <npub> <nsec>");
       process.exit(1);
     }
     await configure(rest[0], rest[1]);
@@ -541,9 +541,9 @@ switch (command) {
       await addServer(rest[0]);
     } else {
       console.error("Usage:");
-      console.error("  up server <url>      Add a server");
-      console.error("  up server list       View configured servers");
-      console.error("  up server prefer     Set preferred server");
+      console.error("  blup server <url>      Add a server");
+      console.error("  blup server list       View configured servers");
+      console.error("  blup server prefer     Set preferred server");
       process.exit(1);
     }
     break;
@@ -556,7 +556,7 @@ switch (command) {
 
   case "upload": {
     if (!rest[0]) {
-      console.error("Usage: up upload <filename>");
+      console.error("Usage: blup upload <filename>");
       process.exit(1);
     }
     const serverUrl = await getPreferredServer();
@@ -566,7 +566,7 @@ switch (command) {
 
   case "mirror": {
     if (!rest[0]) {
-      console.error("Usage: up mirror <url>");
+      console.error("Usage: blup mirror <url>");
       process.exit(1);
     }
     await mirrorBlob(rest[0]);

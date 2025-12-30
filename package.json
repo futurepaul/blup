@@ -1,15 +1,15 @@
 {
-  "name": "up (the blossome uploader)",
-  "description": "Upload files to blossome servers",
+  "name": "blup",
+  "description": "Upload files to Blossom servers",
   "author": "futurepaul",
   "license": "MIT",
-  "homepage": "https://github.com/futurepaul/up",
+  "homepage": "https://github.com/futurepaul/blup",
   "repository": {
     "type": "git",
-    "url": "https://github.com/futurepaul/up.git"
+    "url": "https://github.com/futurepaul/blup.git"
   },
   "bugs": {
-    "url": "https://github.com/futurepaul/up/issues"
+    "url": "https://github.com/futurepaul/blup/issues"
   },
   "keywords": [
     "blossom",
@@ -20,7 +20,7 @@
   ],
   "version": "0.0.1",
   "bin": {
-    "up": "index.ts"
+    "blup": "index.ts"
   },
   "module": "index.ts",
   "type": "module",
