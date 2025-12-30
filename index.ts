@@ -176,12 +176,33 @@ async function uploadBytes(
   }
 
   const hash = new Bun.SHA256().update(bytes).digest("hex");
+  const total = bytes.length;
 
   const authEvent = createAuthEvent(secretKey.data, "upload", hash);
   const authHeader = `Nostr ${btoa(JSON.stringify(authEvent))}`;
 
   const url = `${serverUrl.replace(/\/$/, "")}/upload`;
-  const total = bytes.length;
+
+  // BUD-06: Preflight check with HEAD request
+  const preflightResponse = await fetch(url, {
+    method: "HEAD",
+    headers: {
+      Authorization: authHeader,
+      "X-SHA-256": hash,
+      "X-Content-Type": contentType,
+      "X-Content-Length": total.toString(),
+    },
+  });
+
+  if (!preflightResponse.ok) {
+    const reason = preflightResponse.headers.get("X-Reason");
+    if (reason) {
+      console.error(`Upload rejected: ${reason}`);
+    } else {
+      console.error(`Upload rejected: ${preflightResponse.status}`);
+    }
+    process.exit(1);
+  }
 
   // Create a streaming body with progress
   let loaded = 0;
