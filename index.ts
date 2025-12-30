@@ -143,7 +143,7 @@ async function getNpub(): Promise<string> {
 
 function createAuthEvent(
   secretKey: Uint8Array,
-  type: "list" | "upload",
+  type: "list" | "upload" | "delete",
   sha256Hash?: string
 ) {
   const expiration = Math.floor(Date.now() / 1000) + 60;
@@ -157,10 +157,16 @@ function createAuthEvent(
     tags.push(["x", sha256Hash]);
   }
 
+  const contentMap = {
+    list: "List Blobs",
+    upload: "Upload Blob",
+    delete: "Delete Blob",
+  };
+
   const event = finalizeEvent(
     {
       kind: 24242,
-      content: type === "list" ? "List Blobs" : "Upload Blob",
+      content: contentMap[type],
       created_at: Math.floor(Date.now() / 1000),
       tags,
     },
@@ -205,6 +211,36 @@ async function listBlobs(serverUrl: string): Promise<void> {
 
   const blobs = await response.json();
   console.log(JSON.stringify(blobs, null, 2));
+}
+
+async function deleteBlob(serverUrl: string, sha256: string): Promise<void> {
+  const nsec = await getNsec();
+
+  const secretKey = decode(nsec);
+  if (secretKey.type !== "nsec") {
+    console.error("Error: stored nsec is invalid");
+    process.exit(1);
+  }
+
+  const authEvent = createAuthEvent(secretKey.data, "delete", sha256);
+  const authHeader = `Nostr ${btoa(JSON.stringify(authEvent))}`;
+
+  const url = `${serverUrl.replace(/\/$/, "")}/${sha256}`;
+
+  const response = await fetch(url, {
+    method: "DELETE",
+    headers: {
+      Authorization: authHeader,
+    },
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    console.error(`Error ${response.status}: ${error}`);
+    process.exit(1);
+  }
+
+  console.log(`Deleted ${sha256}`);
 }
 
 async function uploadBytes(
@@ -564,6 +600,7 @@ function printUsage(): void {
   console.log("  blup upload <filename>       Upload a file");
   console.log("  blup mirror <url>            Mirror a URL to your server");
   console.log("  blup list                    List your uploaded blobs");
+  console.log("  blup delete <sha256>         Delete a blob by hash");
   console.log("  blup config <npub> <nsec>    Set up your Nostr keys (stored in system keychain)");
   console.log("  blup server <url>            Add a server to your list");
   console.log("  blup server list             View configured servers");
@@ -628,6 +665,16 @@ switch (command) {
       process.exit(1);
     }
     await mirrorBlob(rest[0]);
+    break;
+  }
+
+  case "delete": {
+    if (!rest[0]) {
+      console.error("Usage: blup delete <sha256>");
+      process.exit(1);
+    }
+    const serverUrl = await getPreferredServer();
+    await deleteBlob(serverUrl, rest[0]);
     break;
   }
 
