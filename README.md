@@ -5,13 +5,13 @@ A simple CLI for uploading and listing files on [Blossom](https://github.com/hzr
 ## Quick start
 
 ```bash
-bunx github:futurepaul/blup
+bunx @futurepaul/blup
 ```
 
 ## Install
 
 ```bash
-bun install -g github:futurepaul/blup
+bun install -g @futurepaul/blup
 ```
 
 ## Usage

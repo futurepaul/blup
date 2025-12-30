@@ -1,5 +1,5 @@
 {
-  "name": "blup",
+  "name": "@futurepaul/blup",
   "description": "Upload files to Blossom servers",
   "author": "futurepaul",
   "license": "MIT",
@@ -18,13 +18,13 @@
     "file",
     "upload"
   ],
-  "version": "0.1",
+  "version": "0.1.0",
   "bin": {
     "blup": "index.ts"
   },
   "module": "index.ts",
   "type": "module",
-  "private": true,
+  "private": false,
   "devDependencies": {
     "@types/bun": "latest"
   },
