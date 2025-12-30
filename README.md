@@ -85,6 +85,23 @@ Mirror an existing URL (Blossom or not) to your preferred server. If a server su
 blup mirror <url>
 ```
 
+### Delete
+
+Delete a blob from your preferred server by its SHA-256 hash:
+
+```bash
+blup delete <sha256>
+```
+
+### Shorthand
+
+You can also use `blup` directly with a file or URL:
+
+```bash
+blup ./image.png          # uploads the file
+blup https://example.com/image.png  # mirrors the URL
+```
+
 ### Blossom servers
 
 Find more Blossom servers at https://blossomservers.com/

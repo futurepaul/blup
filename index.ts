@@ -75,7 +75,14 @@ const DEFAULT_RELAYS = [
   "wss://relay.primal.net",
 ];
 
-const pool = new SimplePool();
+let pool: SimplePool | undefined;
+
+function getPool(): SimplePool {
+  if (!pool) {
+    pool = new SimplePool();
+  }
+  return pool;
+}
 
 function getRelays(): string[] {
   const envRelays = Bun.env.BLUP_RELAYS;
@@ -88,7 +95,7 @@ function getRelays(): string[] {
 async function fetchServerList(pubkey: string): Promise<string[]> {
   const relays = getRelays();
 
-  const event = await pool.get(relays, {
+  const event = await getPool().get(relays, {
     kinds: [10063],
     authors: [pubkey],
   });
@@ -120,7 +127,7 @@ async function publishServerList(
     secretKey
   );
 
-  await Promise.any(pool.publish(relays, event));
+  await Promise.any(getPool().publish(relays, event));
 }
 
 async function getNsec(): Promise<string> {
@@ -227,17 +234,34 @@ async function deleteBlob(serverUrl: string, sha256: string): Promise<void> {
 
   const url = `${serverUrl.replace(/\/$/, "")}/${sha256}`;
 
-  const response = await fetch(url, {
-    method: "DELETE",
-    headers: {
-      Authorization: authHeader,
-    },
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
 
-  if (!response.ok) {
-    const error = await response.text();
-    console.error(`Error ${response.status}: ${error}`);
-    process.exit(1);
+  try {
+    const response = await fetch(url, {
+      method: "DELETE",
+      headers: {
+        Authorization: authHeader,
+      },
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      const error = await response.text();
+      console.error(`Error ${response.status}: ${error}`);
+      process.exit(1);
+    }
+
+    await response.text();
+  } catch (e) {
+    clearTimeout(timeout);
+    // Server may not respond to DELETE but still process it
+    if (e instanceof Error && e.name === "AbortError") {
+      console.log(`Delete request sent for ${sha256}`);
+      return;
+    }
+    throw e;
   }
 
   console.log(`Deleted ${sha256}`);
@@ -608,94 +632,98 @@ function printUsage(): void {
 }
 
 // CLI using Bun.argv
-const args = Bun.argv.slice(2);
+async function main() {
+  const args = Bun.argv.slice(2);
 
-if (args.length < 1) {
-  printUsage();
-  process.exit(1);
-}
-
-const command = args[0]!;
-const rest = args.slice(1);
-
-switch (command) {
-  case "config":
-    if (!rest[0] || !rest[1]) {
-      console.error("Usage: blup config <npub> <nsec>");
-      process.exit(1);
-    }
-    await configure(rest[0], rest[1]);
-    break;
-
-  case "server":
-    if (rest[0] === "list") {
-      await listServers();
-    } else if (rest[0] === "prefer") {
-      await preferServer();
-    } else if (rest[0]) {
-      await addServer(rest[0]);
-    } else {
-      console.error("Usage:");
-      console.error("  blup server <url>      Add a server");
-      console.error("  blup server list       View configured servers");
-      console.error("  blup server prefer     Set preferred server");
-      process.exit(1);
-    }
-    break;
-
-  case "list": {
-    const serverUrl = await getPreferredServer();
-    await listBlobs(serverUrl);
-    break;
-  }
-
-  case "upload": {
-    if (!rest[0]) {
-      console.error("Usage: blup upload <filename>");
-      process.exit(1);
-    }
-    const serverUrl = await getPreferredServer();
-    await uploadBlob(serverUrl, rest[0]);
-    break;
-  }
-
-  case "mirror": {
-    if (!rest[0]) {
-      console.error("Usage: blup mirror <url>");
-      process.exit(1);
-    }
-    await mirrorBlob(rest[0]);
-    break;
-  }
-
-  case "delete": {
-    if (!rest[0]) {
-      console.error("Usage: blup delete <sha256>");
-      process.exit(1);
-    }
-    const serverUrl = await getPreferredServer();
-    await deleteBlob(serverUrl, rest[0]);
-    break;
-  }
-
-  case "help":
-  case "--help":
-  case "-h":
+  if (args.length < 1) {
     printUsage();
-    break;
+    process.exit(1);
+  }
 
-  default:
-    // Check if it's a URL (mirror) or file path (upload)
-    if (command.startsWith("http://") || command.startsWith("https://")) {
-      await mirrorBlob(command);
-    } else if (await Bun.file(command).exists()) {
+  const command = args[0]!;
+  const rest = args.slice(1);
+
+  switch (command) {
+    case "config":
+      if (!rest[0] || !rest[1]) {
+        console.error("Usage: blup config <npub> <nsec>");
+        process.exit(1);
+      }
+      await configure(rest[0], rest[1]);
+      break;
+
+    case "server":
+      if (rest[0] === "list") {
+        await listServers();
+      } else if (rest[0] === "prefer") {
+        await preferServer();
+      } else if (rest[0]) {
+        await addServer(rest[0]);
+      } else {
+        console.error("Usage:");
+        console.error("  blup server <url>      Add a server");
+        console.error("  blup server list       View configured servers");
+        console.error("  blup server prefer     Set preferred server");
+        process.exit(1);
+      }
+      break;
+
+    case "list": {
       const serverUrl = await getPreferredServer();
-      await uploadBlob(serverUrl, command);
-    } else {
-      console.error(`Unknown command or file not found: ${command}`);
-      printUsage();
-      process.exit(1);
+      await listBlobs(serverUrl);
+      break;
     }
+
+    case "upload": {
+      if (!rest[0]) {
+        console.error("Usage: blup upload <filename>");
+        process.exit(1);
+      }
+      const serverUrl = await getPreferredServer();
+      await uploadBlob(serverUrl, rest[0]);
+      break;
+    }
+
+    case "mirror": {
+      if (!rest[0]) {
+        console.error("Usage: blup mirror <url>");
+        process.exit(1);
+      }
+      await mirrorBlob(rest[0]);
+      break;
+    }
+
+    case "delete": {
+      if (!rest[0]) {
+        console.error("Usage: blup delete <sha256>");
+        process.exit(1);
+      }
+      const serverUrl = await getPreferredServer();
+      await deleteBlob(serverUrl, rest[0]);
+      break;
+    }
+
+    case "help":
+    case "--help":
+    case "-h":
+      printUsage();
+      break;
+
+    default:
+      // Check if it's a URL (mirror) or file path (upload)
+      if (command.startsWith("http://") || command.startsWith("https://")) {
+        await mirrorBlob(command);
+      } else if (await Bun.file(command).exists()) {
+        const serverUrl = await getPreferredServer();
+        await uploadBlob(serverUrl, command);
+      } else {
+        console.error(`Unknown command or file not found: ${command}`);
+        printUsage();
+        process.exit(1);
+      }
+      break;
+  }
 }
 
+await main();
 process.exit(0);
