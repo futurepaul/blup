@@ -4,8 +4,53 @@ import { finalizeEvent } from "nostr-tools";
 import { decode } from "nostr-tools/nip19";
 import { SimplePool } from "nostr-tools/pool";
 import { secrets } from "bun";
+import os from "os";
+import path from "path";
 
 const SERVICE_NAME = "com.blossom.blup";
+
+// Config file handling
+interface CachedConfig {
+  servers: string[];
+}
+
+function getConfigDir(): string {
+  const platform = os.platform();
+
+  if (platform === "win32") {
+    const appData = Bun.env.APPDATA || Bun.env.LOCALAPPDATA;
+    if (!appData) throw new Error("APPDATA/LOCALAPPDATA not set");
+    return path.join(appData, "blup");
+  }
+
+  const home = os.homedir();
+  const xdgConfigHome = Bun.env.XDG_CONFIG_HOME || path.join(home, ".config");
+  return path.join(xdgConfigHome, "blup");
+}
+
+function getConfigPath(): string {
+  return path.join(getConfigDir(), "config.json");
+}
+
+async function loadCachedConfig(): Promise<CachedConfig | null> {
+  const configPath = getConfigPath();
+  const file = Bun.file(configPath);
+  if (!(await file.exists())) {
+    return null;
+  }
+  try {
+    return await file.json();
+  } catch {
+    return null;
+  }
+}
+
+async function saveCachedConfig(config: CachedConfig): Promise<void> {
+  const configDir = getConfigDir();
+  await Bun.$`mkdir -p ${configDir}`.quiet();
+  const configPath = getConfigPath();
+  await Bun.write(configPath, JSON.stringify(config, null, 2));
+}
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -194,7 +239,9 @@ async function uploadBytes(
     },
   });
 
-  if (!preflightResponse.ok) {
+  // 404 means server doesn't support BUD-06, proceed with upload
+  // Other non-2xx means rejection
+  if (!preflightResponse.ok && preflightResponse.status !== 404) {
     const reason = preflightResponse.headers.get("X-Reason");
     if (reason) {
       console.error(`Upload rejected: ${reason}`);
@@ -284,7 +331,16 @@ async function configure(npub: string, nsec: string): Promise<void> {
   console.log("Credentials stored in system keychain");
 }
 
-async function getPreferredServer(): Promise<string> {
+async function getServers(forceRefresh = false): Promise<string[]> {
+  // Try cache first unless forcing refresh
+  if (!forceRefresh) {
+    const cached = await loadCachedConfig();
+    if (cached && cached.servers.length > 0) {
+      return cached.servers;
+    }
+  }
+
+  // Fetch from nostr
   const npub = await getNpub();
   const publicKey = decode(npub);
   if (publicKey.type !== "npub") {
@@ -293,6 +349,17 @@ async function getPreferredServer(): Promise<string> {
   }
 
   const servers = await fetchServerList(publicKey.data);
+
+  // Cache the result if we got servers
+  if (servers.length > 0) {
+    await saveCachedConfig({ servers });
+  }
+
+  return servers;
+}
+
+async function getPreferredServer(): Promise<string> {
+  const servers = await getServers();
   if (servers.length === 0) {
     console.error("Error: No servers configured. Run 'blup server <url>' first.");
     process.exit(1);
@@ -310,7 +377,6 @@ async function addServer(serverUrl: string): Promise<void> {
   }
 
   const nsec = await getNsec();
-  const npub = await getNpub();
 
   const secretKey = decode(nsec);
   if (secretKey.type !== "nsec") {
@@ -318,13 +384,8 @@ async function addServer(serverUrl: string): Promise<void> {
     process.exit(1);
   }
 
-  const publicKey = decode(npub);
-  if (publicKey.type !== "npub") {
-    console.error("Error: stored npub is invalid");
-    process.exit(1);
-  }
-
-  const existingServers = await fetchServerList(publicKey.data);
+  // Force refresh from nostr to get latest
+  const existingServers = await getServers(true);
 
   // Add new server to the front if not already present
   const normalizedUrl = serverUrl.replace(/\/$/, "");
@@ -335,18 +396,15 @@ async function addServer(serverUrl: string): Promise<void> {
 
   console.log("Publishing server list to relays...");
   await publishServerList(secretKey.data, newServers);
+
+  // Update cache
+  await saveCachedConfig({ servers: newServers });
   console.log(`Server ${normalizedUrl} added to your server list`);
 }
 
 async function listServers(): Promise<void> {
-  const npub = await getNpub();
-  const publicKey = decode(npub);
-  if (publicKey.type !== "npub") {
-    console.error("Error: stored npub is invalid");
-    process.exit(1);
-  }
-
-  const servers = await fetchServerList(publicKey.data);
+  // Force refresh from nostr
+  const servers = await getServers(true);
   if (servers.length === 0) {
     console.log("No servers configured. Run 'blup server <url>' to add one.");
     return;
@@ -369,7 +427,6 @@ async function prompt(message: string): Promise<string> {
 
 async function preferServer(): Promise<void> {
   const nsec = await getNsec();
-  const npub = await getNpub();
 
   const secretKey = decode(nsec);
   if (secretKey.type !== "nsec") {
@@ -377,13 +434,8 @@ async function preferServer(): Promise<void> {
     process.exit(1);
   }
 
-  const publicKey = decode(npub);
-  if (publicKey.type !== "npub") {
-    console.error("Error: stored npub is invalid");
-    process.exit(1);
-  }
-
-  const servers = await fetchServerList(publicKey.data);
+  // Force refresh from nostr
+  const servers = await getServers(true);
   if (servers.length === 0) {
     console.log("No servers configured. Run 'blup server <url>' to add one.");
     return;
@@ -419,6 +471,9 @@ async function preferServer(): Promise<void> {
 
   console.log("Publishing updated server list...");
   await publishServerList(secretKey.data, newServers);
+
+  // Update cache
+  await saveCachedConfig({ servers: newServers });
   console.log(`${chosen} is now your preferred server`);
 }
 
