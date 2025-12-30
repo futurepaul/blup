@@ -189,7 +189,7 @@ async function listBlobs(serverUrl: string): Promise<void> {
   const authEvent = createAuthEvent(secretKey.data, "list");
   const authHeader = `Nostr ${btoa(JSON.stringify(authEvent))}`;
 
-  const url = `${serverUrl.replace(/\/$/, "")}/list/${publicKey.data}`;
+  const url = `${serverUrl.replace(/\/$/, "")}/list/${publicKey.data}?limit=10`;
 
   const response = await fetch(url, {
     headers: {
