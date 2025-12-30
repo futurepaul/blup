@@ -559,13 +559,15 @@ function printUsage(): void {
   console.log("blup - A simple CLI for Blossom servers");
   console.log("");
   console.log("Usage:");
+  console.log("  blup <file>                  Upload a file (shorthand)");
+  console.log("  blup <url>                   Mirror a URL (shorthand)");
+  console.log("  blup upload <filename>       Upload a file");
+  console.log("  blup mirror <url>            Mirror a URL to your server");
+  console.log("  blup list                    List your uploaded blobs");
   console.log("  blup config <npub> <nsec>    Set up your Nostr keys (stored in system keychain)");
   console.log("  blup server <url>            Add a server to your list");
   console.log("  blup server list             View configured servers");
   console.log("  blup server prefer           Set preferred server");
-  console.log("  blup list                    List your uploaded blobs");
-  console.log("  blup upload <filename>       Upload a file");
-  console.log("  blup mirror <url>            Mirror a URL to your server");
 }
 
 // CLI using Bun.argv
@@ -576,7 +578,8 @@ if (args.length < 1) {
   process.exit(1);
 }
 
-const [command, ...rest] = args;
+const command = args[0]!;
+const rest = args.slice(1);
 
 switch (command) {
   case "config":
@@ -635,9 +638,17 @@ switch (command) {
     break;
 
   default:
-    console.error(`Unknown command: ${command}`);
-    printUsage();
-    process.exit(1);
+    // Check if it's a URL (mirror) or file path (upload)
+    if (command.startsWith("http://") || command.startsWith("https://")) {
+      await mirrorBlob(command);
+    } else if (await Bun.file(command).exists()) {
+      const serverUrl = await getPreferredServer();
+      await uploadBlob(serverUrl, command);
+    } else {
+      console.error(`Unknown command or file not found: ${command}`);
+      printUsage();
+      process.exit(1);
+    }
 }
 
 process.exit(0);
