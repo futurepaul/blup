@@ -1,17 +1,23 @@
 #!/usr/bin/env bun
 
-import { finalizeEvent } from "nostr-tools";
-import { decode } from "nostr-tools/nip19";
+import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools";
+import { decode, nsecEncode, npubEncode } from "nostr-tools/nip19";
 import { SimplePool } from "nostr-tools/pool";
 import { secrets } from "bun";
 import os from "os";
 import path from "path";
 
 const SERVICE_NAME = "com.blossom.blup";
+const DEFAULT_BLOSSOM_SERVER = "https://blossom.band";
 
+// ---------------------------------------------------------------------------
 // Config file handling
+// ---------------------------------------------------------------------------
+
 interface CachedConfig {
   servers: string[];
+  accounts: string[];
+  activeAccount: string;
 }
 
 function getConfigDir(): string {
@@ -32,16 +38,21 @@ function getConfigPath(): string {
   return path.join(getConfigDir(), "config.json");
 }
 
-async function loadCachedConfig(): Promise<CachedConfig | null> {
+async function loadCachedConfig(): Promise<CachedConfig> {
   const configPath = getConfigPath();
   const file = Bun.file(configPath);
   if (!(await file.exists())) {
-    return null;
+    return { servers: [], accounts: [], activeAccount: "" };
   }
   try {
-    return await file.json();
+    const raw = await file.json();
+    return {
+      servers: raw.servers || [],
+      accounts: raw.accounts || [],
+      activeAccount: raw.activeAccount || "",
+    };
   } catch {
-    return null;
+    return { servers: [], accounts: [], activeAccount: "" };
   }
 }
 
@@ -51,6 +62,10 @@ async function saveCachedConfig(config: CachedConfig): Promise<void> {
   const configPath = getConfigPath();
   await Bun.write(configPath, JSON.stringify(config, null, 2));
 }
+
+// ---------------------------------------------------------------------------
+// Formatting helpers
+// ---------------------------------------------------------------------------
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -69,10 +84,19 @@ function renderProgress(loaded: number, total?: number, width = 30): string {
   return `${formatBytes(loaded)}`;
 }
 
+// ---------------------------------------------------------------------------
+// Relay pool
+// ---------------------------------------------------------------------------
+
 const DEFAULT_RELAYS = [
   "wss://relay.damus.io",
   "wss://nos.lol",
   "wss://relay.primal.net",
+];
+
+const LOOKUP_RELAYS = [
+  "wss://purplepag.es",
+  "wss://index.hzrd149.com",
 ];
 
 let pool: SimplePool | undefined;
@@ -92,6 +116,107 @@ function getRelays(): string[] {
   return DEFAULT_RELAYS;
 }
 
+// ---------------------------------------------------------------------------
+// Account management
+// ---------------------------------------------------------------------------
+
+let globalAccountOverride: string | undefined;
+let globalVerbose = false;
+
+async function getActiveAccount(): Promise<string> {
+  if (globalAccountOverride) return globalAccountOverride;
+
+  const config = await loadCachedConfig();
+  if (config.activeAccount) return config.activeAccount;
+  if (config.accounts.length > 0) return config.accounts[0]!;
+
+  // Try legacy migration: old-style keys stored without account prefix
+  const legacyNsec = await secrets.get({ service: SERVICE_NAME, name: "nsec" });
+  if (legacyNsec) {
+    const legacyNpub = await secrets.get({
+      service: SERVICE_NAME,
+      name: "npub",
+    });
+    if (legacyNpub) {
+      await secrets.set({
+        service: SERVICE_NAME,
+        name: "default.nsec",
+        value: legacyNsec,
+      });
+      await secrets.set({
+        service: SERVICE_NAME,
+        name: "default.npub",
+        value: legacyNpub,
+      });
+      config.accounts = ["default"];
+      config.activeAccount = "default";
+      await saveCachedConfig(config);
+      console.log("Migrated existing keys to account 'default'");
+      return "default";
+    }
+  }
+
+  return "";
+}
+
+async function getNsec(): Promise<string> {
+  const account = await getActiveAccount();
+  if (!account) {
+    console.error("Error: No account found. Run 'blup create' first.");
+    process.exit(1);
+  }
+
+  const nsec = await secrets.get({
+    service: SERVICE_NAME,
+    name: `${account}.nsec`,
+  });
+  if (!nsec) {
+    console.error(`Error: No nsec found for account '${account}'.`);
+    process.exit(1);
+  }
+  return nsec;
+}
+
+async function getNpub(): Promise<string> {
+  const account = await getActiveAccount();
+  if (!account) {
+    console.error("Error: No account found. Run 'blup create' first.");
+    process.exit(1);
+  }
+
+  const npub = await secrets.get({
+    service: SERVICE_NAME,
+    name: `${account}.npub`,
+  });
+  if (!npub) {
+    console.error(`Error: No npub found for account '${account}'.`);
+    process.exit(1);
+  }
+  return npub;
+}
+
+function decodeSecretKey(nsec: string): Uint8Array {
+  const decoded = decode(nsec);
+  if (decoded.type !== "nsec") {
+    console.error("Error: stored nsec is invalid");
+    process.exit(1);
+  }
+  return decoded.data;
+}
+
+function decodePubkey(npub: string): string {
+  const decoded = decode(npub);
+  if (decoded.type !== "npub") {
+    console.error("Error: stored npub is invalid");
+    process.exit(1);
+  }
+  return decoded.data;
+}
+
+// ---------------------------------------------------------------------------
+// Server list management
+// ---------------------------------------------------------------------------
+
 async function fetchServerList(pubkey: string): Promise<string[]> {
   const relays = getRelays();
 
@@ -105,7 +230,10 @@ async function fetchServerList(pubkey: string): Promise<string[]> {
   }
 
   return event.tags
-    .filter((t): t is [string, string, ...string[]] => t[0] === "server" && typeof t[1] === "string")
+    .filter(
+      (t): t is [string, string, ...string[]] =>
+        t[0] === "server" && typeof t[1] === "string"
+    )
     .map((t) => t[1]);
 }
 
@@ -130,23 +258,64 @@ async function publishServerList(
   await Promise.any(getPool().publish(relays, event));
 }
 
-async function getNsec(): Promise<string> {
-  const nsec = await secrets.get({ service: SERVICE_NAME, name: "nsec" });
-  if (!nsec) {
-    console.error("Error: No nsec found. Run 'config' first.");
-    process.exit(1);
-  }
-  return nsec;
+async function publishRelayList(
+  secretKey: Uint8Array,
+  relays: string[]
+): Promise<void> {
+  const tags = relays.map((r) => ["r", r]);
+
+  const event = finalizeEvent(
+    {
+      kind: 10002,
+      content: "",
+      created_at: Math.floor(Date.now() / 1000),
+      tags,
+    },
+    secretKey
+  );
+
+  // Publish to both default relays and lookup relays
+  const publishRelays = [...getRelays(), ...LOOKUP_RELAYS];
+  const unique = [...new Set(publishRelays)];
+  await Promise.any(getPool().publish(unique, event));
 }
 
-async function getNpub(): Promise<string> {
-  const npub = await secrets.get({ service: SERVICE_NAME, name: "npub" });
-  if (!npub) {
-    console.error("Error: No npub found. Run 'config' first.");
+async function getServers(forceRefresh = false): Promise<string[]> {
+  if (!forceRefresh) {
+    const cached = await loadCachedConfig();
+    if (cached.servers.length > 0) {
+      return cached.servers;
+    }
+  }
+
+  const npub = await getNpub();
+  const pubkey = decodePubkey(npub);
+  const servers = await fetchServerList(pubkey);
+
+  if (servers.length > 0) {
+    const config = await loadCachedConfig();
+    config.servers = servers;
+    await saveCachedConfig(config);
+  }
+
+  return servers;
+}
+
+async function getPreferredServer(): Promise<string> {
+  const servers = await getServers();
+  if (servers.length === 0) {
+    console.error(
+      "Error: No servers configured. Run 'blup server <url>' first."
+    );
     process.exit(1);
   }
-  return npub;
+
+  return servers[0] as string;
 }
+
+// ---------------------------------------------------------------------------
+// Auth event creation
+// ---------------------------------------------------------------------------
 
 function createAuthEvent(
   secretKey: Uint8Array,
@@ -183,26 +352,21 @@ function createAuthEvent(
   return event;
 }
 
+// ---------------------------------------------------------------------------
+// Blossom operations
+// ---------------------------------------------------------------------------
+
 async function listBlobs(serverUrl: string): Promise<void> {
   const nsec = await getNsec();
   const npub = await getNpub();
 
-  const secretKey = decode(nsec);
-  const publicKey = decode(npub);
+  const secretKey = decodeSecretKey(nsec);
+  const pubkey = decodePubkey(npub);
 
-  if (publicKey.type !== "npub") {
-    console.error("Error: stored npub is invalid");
-    process.exit(1);
-  }
-  if (secretKey.type !== "nsec") {
-    console.error("Error: stored nsec is invalid");
-    process.exit(1);
-  }
-
-  const authEvent = createAuthEvent(secretKey.data, "list");
+  const authEvent = createAuthEvent(secretKey, "list");
   const authHeader = `Nostr ${btoa(JSON.stringify(authEvent))}`;
 
-  const url = `${serverUrl.replace(/\/$/, "")}/list/${publicKey.data}?limit=10`;
+  const url = `${serverUrl.replace(/\/$/, "")}/list/${pubkey}?limit=10`;
 
   const response = await fetch(url, {
     headers: {
@@ -223,13 +387,9 @@ async function listBlobs(serverUrl: string): Promise<void> {
 async function deleteBlob(serverUrl: string, sha256: string): Promise<void> {
   const nsec = await getNsec();
 
-  const secretKey = decode(nsec);
-  if (secretKey.type !== "nsec") {
-    console.error("Error: stored nsec is invalid");
-    process.exit(1);
-  }
+  const secretKey = decodeSecretKey(nsec);
 
-  const authEvent = createAuthEvent(secretKey.data, "delete", sha256);
+  const authEvent = createAuthEvent(secretKey, "delete", sha256);
   const authHeader = `Nostr ${btoa(JSON.stringify(authEvent))}`;
 
   const url = `${serverUrl.replace(/\/$/, "")}/${sha256}`;
@@ -256,7 +416,6 @@ async function deleteBlob(serverUrl: string, sha256: string): Promise<void> {
     await response.text();
   } catch (e) {
     clearTimeout(timeout);
-    // Server may not respond to DELETE but still process it
     if (e instanceof Error && e.name === "AbortError") {
       console.log(`Delete request sent for ${sha256}`);
       return;
@@ -271,19 +430,15 @@ async function uploadBytes(
   serverUrl: string,
   bytes: Uint8Array,
   contentType: string
-): Promise<void> {
+): Promise<{ url: string; sha256: string; size: number; type: string }> {
   const nsec = await getNsec();
 
-  const secretKey = decode(nsec);
-  if (secretKey.type !== "nsec") {
-    console.error("Error: stored nsec is invalid");
-    process.exit(1);
-  }
+  const secretKey = decodeSecretKey(nsec);
 
   const hash = new Bun.SHA256().update(bytes).digest("hex");
   const total = bytes.length;
 
-  const authEvent = createAuthEvent(secretKey.data, "upload", hash);
+  const authEvent = createAuthEvent(secretKey, "upload", hash);
   const authHeader = `Nostr ${btoa(JSON.stringify(authEvent))}`;
 
   const url = `${serverUrl.replace(/\/$/, "")}/upload`;
@@ -299,8 +454,6 @@ async function uploadBytes(
     },
   });
 
-  // 404 means server doesn't support BUD-06, proceed with upload
-  // Other non-2xx means rejection
   if (!preflightResponse.ok && preflightResponse.status !== 404) {
     const reason = preflightResponse.headers.get("X-Reason");
     if (reason) {
@@ -313,7 +466,7 @@ async function uploadBytes(
 
   // Create a streaming body with progress
   let loaded = 0;
-  const chunkSize = 64 * 1024; // 64KB chunks
+  const chunkSize = 64 * 1024;
 
   const progressStream = new ReadableStream<Uint8Array>({
     start(controller) {
@@ -329,7 +482,6 @@ async function uploadBytes(
         loaded += chunk.length;
         process.stdout.write("\r" + renderProgress(loaded, total));
         controller.enqueue(chunk);
-        // Use setTimeout to yield and allow progress to render
         setTimeout(pushChunk, 0);
       };
       pushChunk();
@@ -354,10 +506,13 @@ async function uploadBytes(
   }
 
   const blob = await response.json();
-  console.log(JSON.stringify(blob, null, 2));
+  return blob;
 }
 
-async function uploadBlob(serverUrl: string, filePath: string): Promise<void> {
+async function uploadBlob(
+  serverUrl: string,
+  filePath: string
+): Promise<{ url: string; sha256: string; size: number; type: string }> {
   const file = Bun.file(filePath);
   if (!(await file.exists())) {
     console.error(`Error: File not found: ${filePath}`);
@@ -369,64 +524,440 @@ async function uploadBlob(serverUrl: string, filePath: string): Promise<void> {
   const contentType = file.type || "application/octet-stream";
 
   console.log(`Uploading ${filePath}...`);
-  await uploadBytes(serverUrl, fileBytes, contentType);
+  const blob = await uploadBytes(serverUrl, fileBytes, contentType);
+  if (globalVerbose) {
+    console.log(JSON.stringify(blob, null, 2));
+  } else {
+    console.log(blob.url);
+  }
+  return blob;
 }
 
-async function configure(npub: string, nsec: string): Promise<void> {
+async function mirrorBlob(sourceUrl: string): Promise<void> {
+  const nsec = await getNsec();
+  const serverUrl = await getPreferredServer();
+
+  const secretKey = decodeSecretKey(nsec);
+
+  const mirrorUrl = `${serverUrl.replace(/\/$/, "")}/mirror`;
+
+  const authEvent = createAuthEvent(secretKey, "upload");
+  const authHeader = `Nostr ${btoa(JSON.stringify(authEvent))}`;
+
+  const mirrorResponse = await fetch(mirrorUrl, {
+    method: "PUT",
+    headers: {
+      Authorization: authHeader,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ url: sourceUrl }),
+  });
+
+  if (mirrorResponse.ok) {
+    const blob = await mirrorResponse.json();
+    if (globalVerbose) {
+      console.log(JSON.stringify(blob, null, 2));
+    } else {
+      console.log(blob.url);
+    }
+    return;
+  }
+
+  if (mirrorResponse.status === 404) {
+    console.log(
+      "Server does not support /mirror, downloading and reuploading..."
+    );
+  } else {
+    const error = await mirrorResponse.text();
+    console.log(
+      `Mirror failed (${mirrorResponse.status}: ${error}), downloading and reuploading...`
+    );
+  }
+
+  const sourceResponse = await fetch(sourceUrl);
+  if (!sourceResponse.ok || !sourceResponse.body) {
+    console.error(`Error fetching source: ${sourceResponse.status}`);
+    process.exit(1);
+  }
+
+  const contentType =
+    sourceResponse.headers.get("Content-Type") || "application/octet-stream";
+  const contentLength = sourceResponse.headers.get("Content-Length");
+  const total = contentLength ? parseInt(contentLength, 10) : undefined;
+
+  console.log("Downloading...");
+  const reader = sourceResponse.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let loaded = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    loaded += value.length;
+    process.stdout.write("\r" + renderProgress(loaded, total));
+  }
+  process.stdout.write("\r" + renderProgress(loaded, loaded) + "\n");
+
+  const fileBytes = new Uint8Array(loaded);
+  let offset = 0;
+  for (const chunk of chunks) {
+    fileBytes.set(chunk, offset);
+    offset += chunk.length;
+  }
+
+  console.log("Uploading...");
+  const blob = await uploadBytes(serverUrl, fileBytes, contentType);
+  if (globalVerbose) {
+    console.log(JSON.stringify(blob, null, 2));
+  } else {
+    console.log(blob.url);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Account commands
+// ---------------------------------------------------------------------------
+
+async function createAccount(name?: string): Promise<void> {
+  const accountName = name || "default";
+  const config = await loadCachedConfig();
+
+  if (config.accounts.includes(accountName)) {
+    console.error(`Error: Account '${accountName}' already exists.`);
+    console.error("Use 'blup accounts' to see existing accounts.");
+    process.exit(1);
+  }
+
+  // Generate keypair
+  const sk = generateSecretKey();
+  const pk = getPublicKey(sk);
+  const nsec = nsecEncode(sk);
+  const npub = npubEncode(pk);
+
+  // Store in keychain
+  await secrets.set({
+    service: SERVICE_NAME,
+    name: `${accountName}.nsec`,
+    value: nsec,
+  });
+  await secrets.set({
+    service: SERVICE_NAME,
+    name: `${accountName}.npub`,
+    value: npub,
+  });
+
+  // Update config
+  config.accounts.push(accountName);
+  if (!config.activeAccount) {
+    config.activeAccount = accountName;
+  }
+
+  // Add default blossom server if none configured
+  if (config.servers.length === 0) {
+    config.servers = [DEFAULT_BLOSSOM_SERVER];
+  }
+
+  await saveCachedConfig(config);
+
+  // Publish initial events to the network
+  console.log("Publishing to relays...");
+  const publishResults = { serverList: false, relayList: false };
+  try {
+    await publishServerList(sk, config.servers);
+    publishResults.serverList = true;
+  } catch {
+    // non-fatal
+  }
+  try {
+    await publishRelayList(sk, DEFAULT_RELAYS);
+    publishResults.relayList = true;
+  } catch {
+    // non-fatal
+  }
+
+  console.log(`Account '${accountName}' created`);
+  console.log(`npub: ${npub}`);
+  console.log(`nsec: ${nsec}`);
+  console.log("");
+  console.log("Save your nsec somewhere safe. It won't be shown again.");
+  console.log(`Default blossom server: ${DEFAULT_BLOSSOM_SERVER}`);
+  if (publishResults.relayList) {
+    console.log(`Relay list (NIP-65) published to ${LOOKUP_RELAYS.join(", ")}`);
+  } else {
+    console.log("Note: Could not publish relay list (non-fatal)");
+  }
+}
+
+async function configure(
+  first: string,
+  second: string,
+  third?: string
+): Promise<void> {
+  let accountName: string;
+  let npub: string;
+  let nsec: string;
+
+  if (third) {
+    // blup config <name> <npub> <nsec>
+    accountName = first;
+    npub = second;
+    nsec = third;
+  } else {
+    // blup config <npub> <nsec>
+    accountName = "default";
+    npub = first;
+    nsec = second;
+  }
+
   const publicKey = decode(npub);
   if (publicKey.type !== "npub") {
-    console.error("Error: first argument must be a valid npub");
+    console.error(
+      third
+        ? "Error: second argument must be a valid npub"
+        : "Error: first argument must be a valid npub"
+    );
     process.exit(1);
   }
 
   const secretKey = decode(nsec);
   if (secretKey.type !== "nsec") {
-    console.error("Error: second argument must be a valid nsec");
+    console.error("Error: last argument must be a valid nsec");
     process.exit(1);
   }
 
-  await secrets.set({ service: SERVICE_NAME, name: "npub", value: npub });
-  await secrets.set({ service: SERVICE_NAME, name: "nsec", value: nsec });
+  await secrets.set({
+    service: SERVICE_NAME,
+    name: `${accountName}.nsec`,
+    value: nsec,
+  });
+  await secrets.set({
+    service: SERVICE_NAME,
+    name: `${accountName}.npub`,
+    value: npub,
+  });
 
-  console.log("Credentials stored in system keychain");
+  const config = await loadCachedConfig();
+  if (!config.accounts.includes(accountName)) {
+    config.accounts.push(accountName);
+  }
+  if (!config.activeAccount) {
+    config.activeAccount = accountName;
+  }
+  await saveCachedConfig(config);
+
+  console.log(
+    `Credentials for '${accountName}' stored in system keychain`
+  );
 }
 
-async function getServers(forceRefresh = false): Promise<string[]> {
-  // Try cache first unless forcing refresh
-  if (!forceRefresh) {
-    const cached = await loadCachedConfig();
-    if (cached && cached.servers.length > 0) {
-      return cached.servers;
+async function listAccounts(): Promise<void> {
+  const config = await loadCachedConfig();
+  if (config.accounts.length === 0) {
+    console.log("No accounts. Run 'blup create' to create one.");
+    return;
+  }
+
+  console.log("Accounts:");
+  for (const account of config.accounts) {
+    const marker = account === config.activeAccount ? " (active)" : "";
+    const npub = await secrets.get({
+      service: SERVICE_NAME,
+      name: `${account}.npub`,
+    });
+    console.log(`  ${account}${marker}: ${npub || "unknown"}`);
+  }
+}
+
+async function useAccount(name: string): Promise<void> {
+  const config = await loadCachedConfig();
+  if (!config.accounts.includes(name)) {
+    console.error(`Error: Account '${name}' not found.`);
+    console.error("Run 'blup accounts' to see available accounts.");
+    process.exit(1);
+  }
+
+  config.activeAccount = name;
+  await saveCachedConfig(config);
+  console.log(`Switched to account '${name}'`);
+}
+
+// ---------------------------------------------------------------------------
+// Profile management
+// ---------------------------------------------------------------------------
+
+interface ProfileMetadata {
+  name?: string;
+  about?: string;
+  picture?: string;
+  banner?: string;
+  nip05?: string;
+  lud16?: string;
+  [key: string]: string | undefined;
+}
+
+async function fetchProfile(pubkey: string): Promise<ProfileMetadata | null> {
+  const relays = getRelays();
+  const event = await getPool().get(relays, {
+    kinds: [0],
+    authors: [pubkey],
+  });
+  if (!event) return null;
+  try {
+    return JSON.parse(event.content);
+  } catch {
+    return null;
+  }
+}
+
+async function updateProfile(updates: ProfileMetadata): Promise<void> {
+  const nsec = await getNsec();
+  const npub = await getNpub();
+
+  const secretKey = decodeSecretKey(nsec);
+  const pubkey = decodePubkey(npub);
+
+  // Auto-upload local files for picture and banner
+  for (const field of ["picture", "banner"] as const) {
+    const value = updates[field];
+    if (value && !value.startsWith("http://") && !value.startsWith("https://")) {
+      const file = Bun.file(value);
+      if (await file.exists()) {
+        const serverUrl = await getPreferredServer();
+        console.log(`Uploading ${field}: ${value}...`);
+        const blob = await uploadBytes(serverUrl, new Uint8Array(await file.arrayBuffer()), file.type || "application/octet-stream");
+        updates[field] = blob.url;
+        console.log(`Uploaded: ${blob.url}`);
+      } else {
+        console.error(`Error: File not found: ${value}`);
+        process.exit(1);
+      }
     }
   }
 
-  // Fetch from nostr
+  // Fetch existing profile first (don't overwrite)
+  console.log("Fetching existing profile...");
+  const existing = (await fetchProfile(pubkey)) || {};
+
+  // Merge: only set fields that were explicitly provided
+  const merged: ProfileMetadata = { ...existing };
+  for (const [key, value] of Object.entries(updates)) {
+    if (value !== undefined) {
+      merged[key] = value;
+    }
+  }
+
+  const event = finalizeEvent(
+    {
+      kind: 0,
+      content: JSON.stringify(merged),
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [],
+    },
+    secretKey
+  );
+
+  const relays = getRelays();
+  await Promise.any(getPool().publish(relays, event));
+
+  console.log("Profile updated");
+  printProfile(merged);
+}
+
+function printProfile(profile: ProfileMetadata): void {
+  if (profile.name) console.log(`  Name:      ${profile.name}`);
+  if (profile.about) console.log(`  About:     ${profile.about}`);
+  if (profile.picture) console.log(`  Picture:   ${profile.picture}`);
+  if (profile.banner) console.log(`  Banner:    ${profile.banner}`);
+  if (profile.nip05) console.log(`  NIP-05:    ${profile.nip05}`);
+  if (profile.lud16) console.log(`  Lightning: ${profile.lud16}`);
+}
+
+async function displayImageInTerminal(url: string): Promise<void> {
+  if (!Bun.env.KITTY_PID) return;
+  try {
+    await Bun.$`kitten icat --align=left ${url}`;
+  } catch {
+    // Not in kitty or icat failed, skip
+  }
+}
+
+async function showProfile(): Promise<void> {
   const npub = await getNpub();
-  const publicKey = decode(npub);
-  if (publicKey.type !== "npub") {
-    console.error("Error: stored npub is invalid");
-    process.exit(1);
+  const pubkey = decodePubkey(npub);
+  const account = await getActiveAccount();
+
+  console.log(`Account: ${account}`);
+  console.log(`npub:    ${npub}`);
+
+  console.log("Fetching profile from relays...");
+  const profile = await fetchProfile(pubkey);
+
+  if (!profile) {
+    console.log("No profile found on relays.");
+    console.log("Run 'blup profile --name \"Your Name\"' to create one.");
+    return;
   }
 
-  const servers = await fetchServerList(publicKey.data);
+  console.log("");
+  printProfile(profile);
 
-  // Cache the result if we got servers
-  if (servers.length > 0) {
-    await saveCachedConfig({ servers });
+  if (profile.picture) {
+    await displayImageInTerminal(profile.picture);
   }
-
-  return servers;
 }
 
-async function getPreferredServer(): Promise<string> {
-  const servers = await getServers();
-  if (servers.length === 0) {
-    console.error("Error: No servers configured. Run 'blup server <url>' first.");
-    process.exit(1);
+function parseProfileFlags(args: string[]): ProfileMetadata | null {
+  const updates: ProfileMetadata = {};
+  let hasUpdates = false;
+
+  for (let i = 0; i < args.length; i++) {
+    const flag = args[i];
+    const value = args[i + 1];
+
+    switch (flag) {
+      case "--name":
+        updates.name = value;
+        hasUpdates = true;
+        i++;
+        break;
+      case "--about":
+        updates.about = value;
+        hasUpdates = true;
+        i++;
+        break;
+      case "--picture":
+        updates.picture = value;
+        hasUpdates = true;
+        i++;
+        break;
+      case "--banner":
+        updates.banner = value;
+        hasUpdates = true;
+        i++;
+        break;
+      case "--nip05":
+        updates.nip05 = value;
+        hasUpdates = true;
+        i++;
+        break;
+      case "--lud16":
+        updates.lud16 = value;
+        hasUpdates = true;
+        i++;
+        break;
+      default:
+        console.error(`Unknown flag: ${flag}`);
+        process.exit(1);
+    }
   }
 
-  return servers[0] as string;
+  return hasUpdates ? updates : null;
 }
+
+// ---------------------------------------------------------------------------
+// Server commands
+// ---------------------------------------------------------------------------
 
 async function addServer(serverUrl: string): Promise<void> {
   try {
@@ -437,17 +968,10 @@ async function addServer(serverUrl: string): Promise<void> {
   }
 
   const nsec = await getNsec();
+  const secretKey = decodeSecretKey(nsec);
 
-  const secretKey = decode(nsec);
-  if (secretKey.type !== "nsec") {
-    console.error("Error: stored nsec is invalid");
-    process.exit(1);
-  }
-
-  // Force refresh from nostr to get latest
   const existingServers = await getServers(true);
 
-  // Add new server to the front if not already present
   const normalizedUrl = serverUrl.replace(/\/$/, "");
   const filteredServers = existingServers.filter(
     (s) => s.replace(/\/$/, "") !== normalizedUrl
@@ -455,15 +979,15 @@ async function addServer(serverUrl: string): Promise<void> {
   const newServers = [normalizedUrl, ...filteredServers];
 
   console.log("Publishing server list to relays...");
-  await publishServerList(secretKey.data, newServers);
+  await publishServerList(secretKey, newServers);
 
-  // Update cache
-  await saveCachedConfig({ servers: newServers });
+  const config = await loadCachedConfig();
+  config.servers = newServers;
+  await saveCachedConfig(config);
   console.log(`Server ${normalizedUrl} added to your server list`);
 }
 
 async function listServers(): Promise<void> {
-  // Force refresh from nostr
   const servers = await getServers(true);
   if (servers.length === 0) {
     console.log("No servers configured. Run 'blup server <url>' to add one.");
@@ -487,14 +1011,8 @@ async function prompt(message: string): Promise<string> {
 
 async function preferServer(): Promise<void> {
   const nsec = await getNsec();
+  const secretKey = decodeSecretKey(nsec);
 
-  const secretKey = decode(nsec);
-  if (secretKey.type !== "nsec") {
-    console.error("Error: stored nsec is invalid");
-    process.exit(1);
-  }
-
-  // Force refresh from nostr
   const servers = await getServers(true);
   if (servers.length === 0) {
     console.log("No servers configured. Run 'blup server <url>' to add one.");
@@ -525,115 +1043,79 @@ async function preferServer(): Promise<void> {
     return;
   }
 
-  // Move chosen server to front
   const chosen = servers[choice - 1]!;
   const newServers = [chosen, ...servers.filter((_, i) => i !== choice - 1)];
 
   console.log("Publishing updated server list...");
-  await publishServerList(secretKey.data, newServers);
+  await publishServerList(secretKey, newServers);
 
-  // Update cache
-  await saveCachedConfig({ servers: newServers });
+  const config = await loadCachedConfig();
+  config.servers = newServers;
+  await saveCachedConfig(config);
   console.log(`${chosen} is now your preferred server`);
 }
 
-async function mirrorBlob(sourceUrl: string): Promise<void> {
-  const nsec = await getNsec();
-  const serverUrl = await getPreferredServer();
-
-  const secretKey = decode(nsec);
-  if (secretKey.type !== "nsec") {
-    console.error("Error: stored nsec is invalid");
-    process.exit(1);
-  }
-
-  // First, try the server's /mirror endpoint
-  const mirrorUrl = `${serverUrl.replace(/\/$/, "")}/mirror`;
-
-  // Create auth event for mirror (uses upload type)
-  const authEvent = createAuthEvent(secretKey.data, "upload");
-  const authHeader = `Nostr ${btoa(JSON.stringify(authEvent))}`;
-
-  const mirrorResponse = await fetch(mirrorUrl, {
-    method: "PUT",
-    headers: {
-      Authorization: authHeader,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ url: sourceUrl }),
-  });
-
-  if (mirrorResponse.ok) {
-    const blob = await mirrorResponse.json();
-    console.log(JSON.stringify(blob, null, 2));
-    return;
-  }
-
-  // Fall back to download + upload if /mirror not supported or fails
-  if (mirrorResponse.status === 404) {
-    console.log("Server does not support /mirror, downloading and reuploading...");
-  } else {
-    const error = await mirrorResponse.text();
-    console.log(`Mirror failed (${mirrorResponse.status}: ${error}), downloading and reuploading...`);
-  }
-
-  const sourceResponse = await fetch(sourceUrl);
-  if (!sourceResponse.ok || !sourceResponse.body) {
-    console.error(`Error fetching source: ${sourceResponse.status}`);
-    process.exit(1);
-  }
-
-  const contentType =
-    sourceResponse.headers.get("Content-Type") || "application/octet-stream";
-  const contentLength = sourceResponse.headers.get("Content-Length");
-  const total = contentLength ? parseInt(contentLength, 10) : undefined;
-
-  // Download with progress
-  console.log("Downloading...");
-  const reader = sourceResponse.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let loaded = 0;
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    loaded += value.length;
-    process.stdout.write("\r" + renderProgress(loaded, total));
-  }
-  process.stdout.write("\r" + renderProgress(loaded, loaded) + "\n");
-
-  // Combine chunks
-  const fileBytes = new Uint8Array(loaded);
-  let offset = 0;
-  for (const chunk of chunks) {
-    fileBytes.set(chunk, offset);
-    offset += chunk.length;
-  }
-
-  console.log("Uploading...");
-  await uploadBytes(serverUrl, fileBytes, contentType);
-}
+// ---------------------------------------------------------------------------
+// Help
+// ---------------------------------------------------------------------------
 
 function printUsage(): void {
-  console.log("blup - A simple CLI for Blossom servers");
+  console.log("blup - Nostr identity & Blossom file manager");
   console.log("");
-  console.log("Usage:");
+  console.log("Identity:");
+  console.log("  blup create [name]           Create a new Nostr account");
+  console.log("  blup profile                 Show your profile");
+  console.log(
+    "  blup profile --name <n>      Update profile (--name, --about, --picture, --banner, --nip05, --lud16)"
+  );
+  console.log("  blup accounts                List all accounts");
+  console.log("  blup use <name>              Switch active account");
+  console.log("");
+  console.log("Files:");
   console.log("  blup <file>                  Upload a file (shorthand)");
   console.log("  blup <url>                   Mirror a URL (shorthand)");
   console.log("  blup upload <filename>       Upload a file");
   console.log("  blup mirror <url>            Mirror a URL to your server");
   console.log("  blup list                    List your uploaded blobs");
   console.log("  blup delete <sha256>         Delete a blob by hash");
-  console.log("  blup config <npub> <nsec>    Set up your Nostr keys (stored in system keychain)");
+  console.log("");
+  console.log("Servers:");
   console.log("  blup server <url>            Add a server to your list");
   console.log("  blup server list             View configured servers");
   console.log("  blup server prefer           Set preferred server");
+  console.log("");
+  console.log("Advanced:");
+  console.log(
+    "  blup config <npub> <nsec>    Import existing keys (stored in system keychain)"
+  );
+  console.log(
+    "  blup config <name> <npub> <nsec>  Import keys to a named account"
+  );
+  console.log("");
+  console.log("Global flags:");
+  console.log("  --as <name>                  Use a specific account for this command");
+  console.log("  --verbose, -v                Show full JSON output for uploads");
 }
 
-// CLI using Bun.argv
+// ---------------------------------------------------------------------------
+// CLI entry
+// ---------------------------------------------------------------------------
+
 async function main() {
-  const args = Bun.argv.slice(2);
+  const rawArgs = Bun.argv.slice(2);
+
+  // Pre-process global flags
+  const args: string[] = [];
+  for (let i = 0; i < rawArgs.length; i++) {
+    if (rawArgs[i] === "--as" && rawArgs[i + 1]) {
+      globalAccountOverride = rawArgs[i + 1];
+      i++;
+    } else if (rawArgs[i] === "--verbose" || rawArgs[i] === "-v") {
+      globalVerbose = true;
+    } else {
+      args.push(rawArgs[i]!);
+    }
+  }
 
   if (args.length < 1) {
     printUsage();
@@ -644,12 +1126,42 @@ async function main() {
   const rest = args.slice(1);
 
   switch (command) {
-    case "config":
-      if (!rest[0] || !rest[1]) {
-        console.error("Usage: blup config <npub> <nsec>");
+    case "create":
+      await createAccount(rest[0]);
+      break;
+
+    case "profile": {
+      const updates = parseProfileFlags(rest);
+      if (updates) {
+        await updateProfile(updates);
+      } else {
+        await showProfile();
+      }
+      break;
+    }
+
+    case "accounts":
+      await listAccounts();
+      break;
+
+    case "use":
+      if (!rest[0]) {
+        console.error("Usage: blup use <account-name>");
         process.exit(1);
       }
-      await configure(rest[0], rest[1]);
+      await useAccount(rest[0]);
+      break;
+
+    case "config":
+      if (rest.length === 3) {
+        await configure(rest[0]!, rest[1]!, rest[2]);
+      } else if (rest.length === 2) {
+        await configure(rest[0]!, rest[1]!);
+      } else {
+        console.error("Usage: blup config <npub> <nsec>");
+        console.error("       blup config <name> <npub> <nsec>");
+        process.exit(1);
+      }
       break;
 
     case "server":
@@ -710,7 +1222,6 @@ async function main() {
       break;
 
     default:
-      // Check if it's a URL (mirror) or file path (upload)
       if (command.startsWith("http://") || command.startsWith("https://")) {
         await mirrorBlob(command);
       } else if (await Bun.file(command).exists()) {

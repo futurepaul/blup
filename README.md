@@ -1,12 +1,6 @@
 # blup
 
-A simple CLI for uploading and listing files on [Blossom](https://github.com/hzrd149/blossom) servers.
-
-## Quick start
-
-```bash
-bunx @futurepaul/blup
-```
+Your first steps on Nostr. Create an identity, set up a profile, and upload files — all from the command line.
 
 ## Install
 
@@ -14,94 +8,135 @@ bunx @futurepaul/blup
 bun install -g @futurepaul/blup
 ```
 
-## Usage
-
-### Configure
-
-Set up your Nostr keys (stored in the system keychain):
+Or run directly:
 
 ```bash
-blup config <npub> <nsec>
+bunx @futurepaul/blup
 ```
 
-Example:
-```bash
-blup config npub1... nsec1...
-```
+## Quick Start: Zero to Nostr
 
-### Server list
-
-Blossom best practices encourage keeping an ordered list of trusted upload servers. `blup` publishes (and subsequently reads) this list as a nostr `kind:10063` server-list event. By default the event is synced with `wss://relay.damus.io`, `wss://nos.lol`, and `wss://relay.primal.net`; override this set with `BLUP_RELAYS=wss://relay.one,wss://relay.two`. Run `config` first so `blup` can sign the event with your key. When you list or upload, `blup` fetches the latest published list from those relays (prompting you only when no list exists yet).
-
-Add a server (or create the list if it does not exist):
+### 1. Create your identity
 
 ```bash
-blup server <server-url>
+blup create
 ```
 
-Example:
-```bash
-blup server https://blossom.primal.net
-```
+This generates a Nostr keypair and stores it securely in your system keychain. You'll see your `npub` (public identity) and `nsec` (secret key). Save the nsec — it won't be shown again.
 
-View the configured servers (first entry is the primary upload target):
+It also publishes:
+- A blossom server list (kind 10063) — default: `https://blossom.band`
+- A relay list (NIP-65, kind 10002) — so other clients know where to find you
 
-```bash
-blup server list
-```
-
-Set a different server as preferred:
+### 2. Set up your profile with a picture
 
 ```bash
-blup server prefer
+blup profile --name "My Bot" --about "I make cool hypernote pages" --picture ./avatar.png
 ```
 
-### List files
+Local file paths for `--picture` and `--banner` are automatically uploaded to your Blossom server. You can also pass a URL directly.
 
-List your uploaded blobs on your preferred server:
+This publishes a kind 0 (profile) event to Nostr relays. It fetches any existing profile first and merges your changes, so you won't overwrite fields you didn't specify.
 
-```bash
-blup list
-```
+### 3. You're on Nostr
 
-### Upload
+That's it. Two commands. Your bot now has:
+- A Nostr identity (keypair in system keychain)
+- A profile visible on the network (name, about, picture)
+- A Blossom server for file uploads
+- A relay list so clients can discover you
+- Ready to publish hypernotes (see [hypernote-render](https://github.com/futurepaul/hn-pages-v3/tree/master/packages/hypernote-render))
 
-Upload a file to your preferred server:
+## Upload Files
 
-```bash
-blup upload <filename>
-```
-
-Example:
 ```bash
 blup upload ./image.png
 ```
 
-### Mirror
-
-Mirror an existing URL (Blossom or not) to your preferred server. If a server supports `/mirror`, it will fetch directly; otherwise `blup` downloads the source blob and reuploads it.
+Prints the URL of the uploaded file. Use `--verbose` (`-v`) for full JSON response with sha256, size, nip94 tags, etc.
 
 ```bash
-blup mirror <url>
+blup -v upload ./image.png    # full JSON output
+blup mirror https://...       # mirror a URL to your server
 ```
 
-### Delete
+## Multiple Accounts
 
-Delete a blob from your preferred server by its SHA-256 hash:
+blup supports named accounts. The first account you create is the default.
 
 ```bash
-blup delete <sha256>
+blup create             # creates account named "default"
+blup create mybot       # creates account named "mybot"
+blup accounts           # list all accounts
+blup use mybot          # switch active account
 ```
 
-### Shorthand
-
-You can also use `blup` directly with a file or URL:
+Use `--as` to run any command with a specific account without switching:
 
 ```bash
-blup ./image.png          # uploads the file
-blup https://example.com/image.png  # mirrors the URL
+blup --as mybot profile
+blup --as mybot upload ./image.png
 ```
 
-### Blossom servers
+## Commands
 
-Find more Blossom servers at https://blossomservers.com/
+### Identity
+
+| Command | Description |
+|---------|-------------|
+| `blup create [name]` | Create a new Nostr account |
+| `blup profile` | Show your current profile |
+| `blup profile --name <n> ...` | Update profile fields |
+| `blup accounts` | List all accounts |
+| `blup use <name>` | Switch active account |
+
+Profile flags: `--name`, `--about`, `--picture`, `--banner`, `--nip05`, `--lud16`
+
+`--picture` and `--banner` accept either a URL or a local file path (auto-uploaded).
+
+### Files
+
+| Command | Description |
+|---------|-------------|
+| `blup upload <file>` | Upload a file to your Blossom server |
+| `blup mirror <url>` | Mirror a URL to your server |
+| `blup list` | List your uploaded blobs |
+| `blup delete <sha256>` | Delete a blob by hash |
+| `blup <file>` | Shorthand: upload a file |
+| `blup <url>` | Shorthand: mirror a URL |
+
+### Servers
+
+| Command | Description |
+|---------|-------------|
+| `blup server <url>` | Add a Blossom server |
+| `blup server list` | View configured servers |
+| `blup server prefer` | Set preferred server |
+
+Your server list is published as a kind 10063 event to Nostr relays (`wss://relay.damus.io`, `wss://nos.lol`, `wss://relay.primal.net`). Override with `BLUP_RELAYS=wss://relay.one,wss://relay.two`.
+
+### Advanced
+
+| Command | Description |
+|---------|-------------|
+| `blup config <npub> <nsec>` | Import existing keys |
+| `blup config <name> <npub> <nsec>` | Import keys to a named account |
+
+### Global Flags
+
+| Flag | Description |
+|------|-------------|
+| `--as <name>` | Use a specific account for this command |
+| `--verbose`, `-v` | Show full JSON output for uploads |
+
+## How It Works
+
+- **Keys** are stored in your system keychain (macOS Keychain, Windows Credential Manager, or `~/.config/blup/` on Linux)
+- **Server list** and account info are cached in `~/.config/blup/config.json`
+- **Uploads** use the Blossom protocol with NIP-24242 auth events signed by your key
+- **Profile updates** fetch the existing kind 0 event, merge your changes, and republish — so you never accidentally overwrite fields
+- **Relay list** (NIP-65) is published to `wss://purplepag.es` and `wss://index.hzrd149.com` so clients using the outbox model can discover you
+
+## Find Blossom Servers
+
+Browse public Blossom servers at https://blossomservers.com/
