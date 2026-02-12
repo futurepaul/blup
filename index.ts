@@ -3,7 +3,17 @@
 import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools";
 import { decode, nsecEncode, npubEncode } from "nostr-tools/nip19";
 import { SimplePool } from "nostr-tools/pool";
-import { secrets } from "bun";
+// Try bun:secrets, fall back to no-op if unavailable (e.g. no system keychain)
+let secrets: { get: (opts: {service: string, name: string}) => Promise<string | undefined>, set: (opts: {service: string, name: string, value: string}) => Promise<void> };
+try {
+  secrets = (await import("bun")).secrets;
+  if (!secrets || typeof secrets.get !== "function") throw new Error("no secrets");
+} catch {
+  secrets = {
+    async get() { return undefined; },
+    async set() {},
+  };
+}
 import os from "os";
 import path from "path";
 
@@ -160,9 +170,13 @@ async function getActiveAccount(): Promise<string> {
 }
 
 async function getNsec(): Promise<string> {
+  // Allow env var override (for headless / no-keychain environments)
+  const envNsec = process.env.BLUP_NSEC;
+  if (envNsec) return envNsec;
+
   const account = await getActiveAccount();
   if (!account) {
-    console.error("Error: No account found. Run 'blup create' first.");
+    console.error("Error: No account found. Run 'blup create' first, or set BLUP_NSEC env var.");
     process.exit(1);
   }
 
@@ -171,16 +185,20 @@ async function getNsec(): Promise<string> {
     name: `${account}.nsec`,
   });
   if (!nsec) {
-    console.error(`Error: No nsec found for account '${account}'.`);
+    console.error(`Error: No nsec found for account '${account}'. Set BLUP_NSEC env var as fallback.`);
     process.exit(1);
   }
   return nsec;
 }
 
 async function getNpub(): Promise<string> {
+  // Allow env var override
+  const envNpub = process.env.BLUP_NPUB;
+  if (envNpub) return envNpub;
+
   const account = await getActiveAccount();
   if (!account) {
-    console.error("Error: No account found. Run 'blup create' first.");
+    console.error("Error: No account found. Run 'blup create' first, or set BLUP_NPUB env var.");
     process.exit(1);
   }
 
